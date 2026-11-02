@@ -152,7 +152,7 @@ public sealed class ProtonCaptureProvider : IPacketCaptureProvider, ICaptureDiag
             try
             {
                 _stage = "connect";
-                using TcpClient client = new TcpClient();
+                using TcpClient client = new TcpClient(AddressFamily.InterNetwork);
                 client.NoDelay = true;
                 client.ReceiveBufferSize = 4 * 1024 * 1024;
                 lock (_gate)

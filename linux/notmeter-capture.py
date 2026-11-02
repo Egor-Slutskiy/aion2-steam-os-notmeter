@@ -113,20 +113,34 @@ def open_capture(port):
 # ------------------------------------------------------------ peer checking
 
 def peer_uid(conn):
-    """uid that owns the client end of a 127.0.0.1 TCP connection (via /proc/net/tcp)."""
+    """uid that owns the client end of a loopback TCP connection.
+
+    Looks in /proc/net/tcp and /proc/net/tcp6: .NET and many other runtimes use
+    dual-stack IPv6 sockets, so a connect to 127.0.0.1 shows up in tcp6 as
+    ::ffff:127.0.0.1.
+    """
     try:
-        _, peer_port = conn.getpeername()
-        _, my_port = conn.getsockname()
-        want_local = "0100007F:%04X" % peer_port
-        want_remote = "0100007F:%04X" % my_port
-        with open("/proc/net/tcp") as f:
-            next(f)
-            for line in f:
-                parts = line.split()
-                if parts[1] == want_local and parts[2] == want_remote:
-                    return int(parts[7])
-    except Exception:
-        pass
+        peer_port = conn.getpeername()[1]
+        my_port = conn.getsockname()[1]
+    except OSError:
+        return None
+
+    def loopback_port(field):
+        addr, _, port = field.rpartition(":")
+        # 127.0.0.1 is "0100007F" in tcp and ends the mapped address in tcp6.
+        return int(port, 16) if addr.endswith("0100007F") else None
+
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path) as f:
+                next(f)
+                for line in f:
+                    parts = line.split()
+                    if (len(parts) > 7 and loopback_port(parts[1]) == peer_port
+                            and loopback_port(parts[2]) == my_port):
+                        return int(parts[7])
+        except (OSError, ValueError):
+            continue
     return None
 
 
