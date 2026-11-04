@@ -50,6 +50,11 @@ public sealed class ProtonCaptureProvider : IPacketCaptureProvider, ICaptureDiag
     private long _parseErrors;
     private string _stage = "idle";
     private string _errorType = string.Empty;
+    private long _remapped;
+
+    // Off with NOTMETER_PROXY_REMAP=0.
+    private readonly GameConnectionTable? _gameConnections =
+        Environment.GetEnvironmentVariable("NOTMETER_PROXY_REMAP") == "0" ? null : new GameConnectionTable();
 
     public ProtonCaptureProvider(CaptureProviderContext context)
     {
@@ -134,7 +139,7 @@ public sealed class ProtonCaptureProvider : IPacketCaptureProvider, ICaptureDiag
         return new CaptureDiagnosticsSnapshot(_stage, _errorType, 0, 228u,
             Interlocked.Read(ref _records), Interlocked.Read(ref _bytes),
             Interlocked.Read(ref _inbound), Interlocked.Read(ref _outbound),
-            0, Interlocked.Read(ref _emptyPayload), 0, Interlocked.Read(ref _parseErrors));
+            0, Interlocked.Read(ref _emptyPayload), Interlocked.Read(ref _remapped), Interlocked.Read(ref _parseErrors));
     }
 
     private void Run(CancellationToken token)
@@ -281,6 +286,19 @@ public sealed class ProtonCaptureProvider : IPacketCaptureProvider, ICaptureDiag
         uint sequence = ReadU32(p, ipHeader + 4);
         byte[] payload = new byte[payloadLength];
         Buffer.BlockCopy(p, payloadOffset, payload, 0, payloadLength);
+
+        GameConnectionTable.Connection? game = null;
+        if (_gameConnections != null && OperatingSystem.IsWindows())
+        {
+            game = _gameConnections.MapInbound(source, sourcePort, destination, destinationPort);
+        }
+        if (game is GameConnectionTable.Connection mapped)
+        {
+            // Proxied connection: present it as the game's own socket.
+            Interlocked.Increment(ref _remapped);
+            destination = mapped.LocalAddress;
+            destinationPort = mapped.LocalPort;
+        }
 
         TcpPayloadCaptured?.Invoke(this, new CapturedTcpPayload(
             source, destination, sourcePort, destinationPort, sequence, payload, arrivedAt, DeviceName));
