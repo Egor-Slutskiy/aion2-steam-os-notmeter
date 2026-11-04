@@ -250,6 +250,126 @@ def serve_client(conn, args):
         conn.close()
 
 
+# --------------------------------------------------------------- diagnostics
+
+ETH_P_IPV6 = 0x86DD
+
+
+def _proc_addr(field, v6):
+    """'0100007F:1F90' -> ('127.0.0.1', 8080) for /proc/net/tcp[6] fields."""
+    addr, port = field.split(":")
+    raw = bytes.fromhex(addr)
+    # The kernel prints each 32-bit word in host (little-endian) order.
+    raw = b"".join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4))
+    if v6:
+        if raw[:12] == b"\0" * 10 + b"\xff\xff":
+            return socket.inet_ntop(socket.AF_INET, raw[12:]), int(port, 16)
+        return socket.inet_ntop(socket.AF_INET6, raw), int(port, 16)
+    return socket.inet_ntop(socket.AF_INET, raw), int(port, 16)
+
+
+def game_connections():
+    """TCP connections owned by processes whose command line mentions aion2.exe."""
+    pids = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % d, "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").lower()
+        except OSError:
+            continue
+        if b"aion2.exe" in cmd and b"notmeter.exe" not in cmd and b"notmeter-capture" not in cmd:
+            pids.append(int(d))
+    inodes = {}
+    for pid in pids:
+        try:
+            for fd in os.listdir("/proc/%d/fd" % pid):
+                try:
+                    link = os.readlink("/proc/%d/fd/%s" % (pid, fd))
+                except OSError:
+                    continue
+                if link.startswith("socket:["):
+                    inodes[link[8:-1]] = pid
+        except OSError:
+            continue
+    states = {"01": "ESTABLISHED", "02": "SYN_SENT", "06": "TIME_WAIT", "08": "CLOSE_WAIT", "0A": "LISTEN"}
+    conns = []
+    for path, v6 in (("/proc/net/tcp", False), ("/proc/net/tcp6", True)):
+        try:
+            with open(path) as f:
+                next(f)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) > 9 and parts[9] in inodes:
+                        local = _proc_addr(parts[1], v6)
+                        remote = _proc_addr(parts[2], v6)
+                        conns.append(("tcp6" if v6 else "tcp", local, remote,
+                                      states.get(parts[3], parts[3]), inodes[parts[9]]))
+        except OSError:
+            pass
+    return pids, conns
+
+
+def run_diag(seconds):
+    print("== NotMeter capture diagnostics (%s)" % VERSION)
+    print("\n== interfaces")
+    try:
+        import subprocess
+        print(subprocess.run(["ip", "-br", "addr"], capture_output=True, text=True).stdout.rstrip())
+        print("\n== routes")
+        print(subprocess.run(["ip", "route", "get", "1.1.1.1"], capture_output=True, text=True).stdout.rstrip())
+        print(subprocess.run(["ip", "-6", "route", "get", "2606:4700::1111"], capture_output=True, text=True).stdout.rstrip()
+              or "(no IPv6 route)")
+    except Exception as e:
+        print("ip not available:", e)
+
+    pids, conns = game_connections()
+    print("\n== Aion2 processes: %s" % (pids or "NOT FOUND (start the game first)"))
+    for fam, local, remote, state, pid in conns:
+        if state != "LISTEN":
+            print("  %-4s %s:%d -> %s:%d %s (pid %d)" % (fam, local[0], local[1], remote[0], remote[1], state, pid))
+    game_ports = {local[1] for _, local, _, st, _ in conns if st != "LISTEN"}
+
+    print("\n== capturing all TCP for %d s, play/move in the game..." % seconds)
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(ETH_P_ALL))
+    s.settimeout(0.5)
+    flows = {}
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            data, addr = s.recvfrom(65535)
+        except socket.timeout:
+            continue
+        ifname, proto, pkttype = addr[0], addr[1], addr[2]
+        if ifname == "lo" or pkttype not in WANTED_PKTTYPES:
+            continue
+        if proto == ETH_P_IP and len(data) >= 40 and data[9] == 6:
+            ihl = (data[0] & 0x0F) * 4
+            src, dst = socket.inet_ntop(socket.AF_INET, data[12:16]), socket.inet_ntop(socket.AF_INET, data[16:20])
+            fam = "ipv4"
+        elif proto == ETH_P_IPV6 and len(data) >= 60 and data[6] == 6:
+            ihl = 40
+            src, dst = socket.inet_ntop(socket.AF_INET6, data[8:24]), socket.inet_ntop(socket.AF_INET6, data[24:40])
+            fam = "ipv6"
+        else:
+            continue
+        sport, dport = struct.unpack(">HH", data[ihl:ihl + 4])
+        direction = "out" if pkttype == PACKET_OUTGOING else "in "
+        key = (ifname, fam, direction, src, sport, dst, dport)
+        n, b = flows.get(key, (0, 0))
+        flows[key] = (n + 1, b + len(data))
+    s.close()
+    top = sorted(flows.items(), key=lambda kv: -kv[1][1])[:25]
+    for (ifname, fam, direction, src, sport, dst, dport), (n, b) in top:
+        mark = "  <== game socket" if sport in game_ports or dport in game_ports else ""
+        print("  %-12s %s %s %s:%d -> %s:%d  %d pkts %d bytes%s" % (
+            ifname, fam, direction, src, sport, dst, dport, n, b, mark))
+    if not top:
+        print("  no TCP packets seen")
+    print("\nCopy everything above and send it.")
+
+
 def main():
     p = argparse.ArgumentParser(description="NotMeter capture helper for Linux / Steam Deck")
     p.add_argument("--listen", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
@@ -263,7 +383,13 @@ def main():
     p.add_argument("--allow-uid", type=int, action="append", default=[],
                    help="only serve clients running as this uid (default: SUDO_UID / PKEXEC_UID, else any)")
     p.add_argument("--any-uid", action="store_true", help="serve clients of any local user")
+    p.add_argument("--diag", type=int, nargs="?", const=20, metavar="SECONDS",
+                   help="print game connections and captured TCP flows, then exit")
     args = p.parse_args()
+
+    if args.diag:
+        run_diag(args.diag)
+        return
 
     if os.geteuid() != 0:
         log("warning: not running as root, capture will probably fail (run with sudo)")
